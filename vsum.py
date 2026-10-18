@@ -3,9 +3,11 @@
 
 Usage:
     uv run vsum.py <youtube-url> [--out output] [--model sonnet] [--lang en]
+                   [--whisper small] [--use-subs]
 
-Pipeline: yt-dlp (video + subtitles + chapters) -> `claude -p` (summary as JSON)
--> yt-dlp 2s clips + ffmpeg (one frame per section) -> summary.md
+Pipeline: yt-dlp (audio + chapters) -> faster-whisper (local transcript)
+-> `claude -p` (summary as JSON) -> yt-dlp 2s clips + ffmpeg (one frame per
+section) -> summary.md.  With --use-subs, YouTube subtitles replace the audio steps.
 """
 import argparse
 import json
@@ -60,6 +62,35 @@ def fetch(url: str, workdir: Path, lang: str, download_video: bool) -> tuple[dic
     # Prefer the original-language auto track, then manual/regional tracks.
     subs = sorted(workdir.glob("video*.vtt"), key=lambda p: ("-orig" not in p.name, p.name))
     return info, video, subs[0] if subs else None
+
+
+def fetch_audio(url: str, workdir: Path) -> tuple[dict, Path]:
+    """Download the best audio-only stream plus metadata/chapters. Returns (info, audio)."""
+    opts = {**YDL_BASE, "format": "ba/b", "outtmpl": str(workdir / "audio.%(ext)s")}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    return info, next(p for p in workdir.glob("audio.*") if p.suffix != ".part")
+
+
+def transcribe(audio: Path, model_name: str, lang: str) -> list[tuple[float, str]]:
+    """Transcribe locally with faster-whisper. Returns [(start_seconds, text)]."""
+    import numpy as np
+    from faster_whisper import WhisperModel
+
+    # Decode with the ffmpeg CLI (16 kHz mono float32) rather than faster-whisper's bundled PyAV decoder.
+    raw = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(audio), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(np.frombuffer(raw, dtype=np.float32), language=lang, vad_filter=True)
+    cues = []
+    for seg in segments:
+        if seg.text.strip():
+            cues.append((seg.start, seg.text.strip()))
+        print(f"\r   {fmt_ts(seg.end)} / {fmt_ts(info.duration)}", end="", flush=True)
+    print()
+    return cues
 
 
 def parse_vtt(path: Path) -> list[tuple[float, str]]:
@@ -220,6 +251,10 @@ def main() -> None:
     ap.add_argument("--out", default="output", help="output root directory (default: output)")
     ap.add_argument("--model", default="sonnet", help="model passed to `claude -p` (default: sonnet)")
     ap.add_argument("--lang", default="en", help="subtitle language (default: en)")
+    ap.add_argument("--whisper", default="small",
+                    help="faster-whisper model size: tiny/base/small/medium/large-v3 (default: small)")
+    ap.add_argument("--use-subs", action="store_true",
+                    help="use YouTube subtitles instead of transcribing the audio locally")
     ap.add_argument("--download", action="store_true",
                     help="download the full video (kept in the output folder) instead of short clips")
     args = ap.parse_args()
@@ -232,16 +267,26 @@ def main() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
 
-    print("⬇️  Fetching metadata and subtitles…" if not args.download else "⬇️  Downloading video and subtitles…")
-    info, video, vtt = fetch(args.url, tmp, args.lang, args.download)
-    if not vtt:
-        sys.exit(f"No '{args.lang}' subtitles (manual or auto) available for this video.")
+    video = None
+    if args.use_subs:
+        print("⬇️  Fetching metadata and subtitles…" if not args.download else "⬇️  Downloading video and subtitles…")
+        info, video, vtt = fetch(args.url, tmp, args.lang, args.download)
+        if not vtt:
+            sys.exit(f"No '{args.lang}' subtitles (manual or auto) available for this video.")
+        cues = parse_vtt(vtt)
+    else:
+        print("⬇️  Downloading audio…")
+        info, audio = fetch_audio(args.url, tmp)
+        print(f"🎙️  Transcribing locally with whisper ({args.whisper})…")
+        cues = transcribe(audio, args.whisper, args.lang)
+        if args.download:
+            video = fetch(args.url, tmp, args.lang, True)[1]
 
     outdir = Path(args.out) / slugify(info.get("title", "video"))
     snapdir = outdir / "snapshots"
     snapdir.mkdir(parents=True, exist_ok=True)
 
-    transcript = chunk_transcript(parse_vtt(vtt))
+    transcript = chunk_transcript(cues)
     (outdir / "transcript.md").write_text(f"# Transcript: {info.get('title', '')}\n\n" + transcript.replace("\n", "\n\n"))
 
     print(f"🧠 Summarizing with claude -p ({args.model})…")
