@@ -66,7 +66,7 @@ def fetch(url: str, workdir: Path, lang: str, download_video: bool) -> tuple[dic
 
 def fetch_audio(url: str, workdir: Path) -> tuple[dict, Path]:
     """Download the best audio-only stream plus metadata/chapters. Returns (info, audio)."""
-    opts = {**YDL_BASE, "format": "ba/b", "outtmpl": str(workdir / "audio.%(ext)s")}
+    opts = {**YDL_BASE, "format": "ba[language^=en][protocol=https]/ba[protocol=https]/ba/b", "outtmpl": str(workdir / "audio.%(ext)s")}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     return info, next(p for p in workdir.glob("audio.*") if p.suffix != ".part")
